@@ -1,0 +1,15 @@
+[project]
+name = "vrh_simulator"
+version = "0.1.0"
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-64", "osx-arm64", "win-64"]
+
+[tasks]
+sim = "python code/sim.py"
+
+[dependencies]
+python = ">=3.10,<3.13"
+numpy = ">=2.0,<3"
+scipy = ">=1.13,<2"
+fire = ">=0.7,<0.8"
+matplotlib-base = ">=3.9,<4"
