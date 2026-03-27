@@ -90,6 +90,8 @@ class RRNSolver:
             raise ValueError("temperature must be > 0")
         if self.xi <= 0:
             raise ValueError("xi must be > 0")
+        if self.G0 <= 0:
+            raise ValueError("G0 must be > 0")
 
         self.n_sites = len(self.energies)
 
@@ -102,39 +104,68 @@ class RRNSolver:
         ej = self.energies[None, :]
         return 0.5 * (np.abs(ei) + np.abs(ej) + np.abs(ei - ej))
 
-    def build_conductance_matrix(self) -> csr_matrix:
+    def build_scaled_conductance_matrix(self) -> tuple[csr_matrix, float]:
         """
-        Build symmetric sparse conductance matrix C where C[i, j] = G_ij.
+        Build a symmetric sparse conductance matrix scaled by a global factor.
+
+        The matrix entries are assembled from
+            log(G_ij) = log(G0 / T) - 2*r_ij/xi - eps_ij/(kB*T)
+        and then shifted by the largest active log-conductance before
+        exponentiation. Solving the network with a globally scaled conductance
+        matrix leaves node voltages unchanged while improving numerical
+        stability. The caller is responsible for rescaling currents by
+        exp(log_shift).
         """
         N = self.n_sites
         dist = self.pairwise_distances()
         eps = self.pairwise_energy_cost()
+        log_G = np.log(self.G0 / self.temperature) - 2.0 * dist / self.xi - (
+            eps / (self.kB * self.temperature)
+        )
 
-        with np.errstate(over="ignore", under="ignore"):
-            G = (self.G0 / self.temperature) * np.exp(-2.0 * dist / self.xi) * np.exp(
-                -eps / (self.kB * self.temperature)
-            )
-
-        np.fill_diagonal(G, 0.0)
+        active_mask = np.ones_like(log_G, dtype=bool)
+        np.fill_diagonal(active_mask, False)
 
         if self.cutoff_distance is not None:
-            G[dist > self.cutoff_distance] = 0.0
+            active_mask &= dist <= self.cutoff_distance
 
         if self.max_neighbors is not None:
-            # Keep only nearest max_neighbors for each row
-            pruned = np.zeros_like(G, dtype=bool)
+            pruned = np.zeros_like(active_mask, dtype=bool)
             for i in range(N):
                 row = dist[i].copy()
                 row[i] = np.inf
                 nn_idx = np.argsort(row)[: self.max_neighbors]
                 pruned[i, nn_idx] = True
-            # Symmetrize neighbor mask
             keep = pruned | pruned.T
-            G[~keep] = 0.0
+            active_mask &= keep
 
-        G[G < self.min_conductance] = 0.0
+        if self.min_conductance > 0.0:
+            active_mask &= log_G >= np.log(self.min_conductance)
 
-        return csr_matrix(G)
+        if not np.any(active_mask):
+            return csr_matrix((N, N), dtype=float), 0.0
+
+        log_shift = float(np.max(log_G[active_mask]))
+        G_scaled = np.zeros_like(log_G)
+        G_scaled[active_mask] = np.exp(log_G[active_mask] - log_shift)
+
+        return csr_matrix(G_scaled), log_shift
+
+    @staticmethod
+    def rescale_sparse_matrix(matrix: csr_matrix, scale_factor: float) -> csr_matrix:
+        if np.isclose(scale_factor, 1.0):
+            return matrix.copy()
+        scaled_matrix = matrix.copy()
+        scaled_matrix.data *= scale_factor
+        return scaled_matrix
+
+    def build_conductance_matrix(self) -> csr_matrix:
+        """
+        Build symmetric sparse conductance matrix C where C[i, j] = G_ij.
+        """
+        C_scaled, log_shift = self.build_scaled_conductance_matrix()
+        scale_factor = float(np.exp(log_shift))
+        return self.rescale_sparse_matrix(C_scaled, scale_factor)
 
     @staticmethod
     def build_laplacian(C: csr_matrix) -> csr_matrix:
@@ -171,8 +202,9 @@ class RRNSolver:
         boundary = np.unique(np.concatenate([left_nodes, right_nodes]))
         internal = np.setdiff1d(all_nodes, boundary)
 
-        C = self.build_conductance_matrix()
-        L = self.build_laplacian(C)
+        C_scaled, log_shift = self.build_scaled_conductance_matrix()
+        scale_factor = float(np.exp(log_shift))
+        L_scaled = self.build_laplacian(C_scaled)
 
         V_boundary = np.zeros(N, dtype=float)
         V_boundary[left_nodes] = V_left
@@ -182,27 +214,30 @@ class RRNSolver:
         V[boundary] = V_boundary[boundary]
 
         if internal.size > 0:
-            L_ii = L[internal][:, internal]
-            L_ib = L[internal][:, boundary]
+            L_ii = L_scaled[internal][:, internal]
+            L_ib = L_scaled[internal][:, boundary]
             b = -L_ib @ V_boundary[boundary]
             V_internal = spsolve(L_ii, b)
             V[internal] = V_internal
 
         # Total current injected from left contact:
         # I_left = sum_{i in left} sum_j G_ij * (V_i - V_j)
-        total_current = 0.0
+        total_current_scaled = 0.0
         for i in left_nodes:
-            row = C.getrow(i)
+            row = C_scaled.getrow(i)
             js = row.indices
             gij = row.data
-            total_current += np.sum(gij * (V[i] - V[js]))
+            total_current_scaled += np.sum(gij * (V[i] - V[js]))
 
         delta_V = V_left - V_right
         if np.isclose(delta_V, 0.0):
             raise ValueError("V_left and V_right must be different")
 
+        total_current = total_current_scaled * scale_factor
         effective_conductance = total_current / delta_V
         effective_resistance = np.inf if np.isclose(effective_conductance, 0.0) else 1.0 / effective_conductance
+        C = self.rescale_sparse_matrix(C_scaled, scale_factor)
+        L = self.rescale_sparse_matrix(L_scaled, scale_factor)
 
         return RRNResult(
             voltages=V,

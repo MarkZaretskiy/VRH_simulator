@@ -21,6 +21,11 @@ NM_TO_CM = 1.0e-7
 FIT_RESPONSE_REGULARIZATION = 1.0e-12
 AVERAGED_CURVE_FLOOR_FACTOR = 0.5
 VRH_COLORMAP_MAX_MILLI = 15.0
+PLOT_HIGHLIGHT_XI_COLORS = (
+    (0.1, "blue"),
+    (0.15, "red"),
+    (0.3, "green"),
+)
 
 
 @dataclass(frozen=True)
@@ -103,6 +108,67 @@ def parse_xi_values(
     if not xi_list:
         raise ValueError("at least one xi value is required")
     return xi_list
+
+
+def parse_energy_span_values(
+    energy_span_ev: str | float | int | list[float] | tuple[float, ...],
+) -> tuple[float, ...]:
+    if isinstance(energy_span_ev, str):
+        if ":" in energy_span_ev and "," not in energy_span_ev:
+            start_text, stop_text, step_text = (
+                token.strip() for token in energy_span_ev.split(":")
+            )
+            start = float(start_text)
+            stop = float(stop_text)
+            step = float(step_text)
+            if step <= 0:
+                raise ValueError("energy span range step must be > 0")
+
+            values = np.arange(start, stop + 0.5 * step, step, dtype=float)
+            if values.size == 0:
+                raise ValueError("energy span range must contain at least one value")
+            return tuple(np.round(values, 10))
+
+        tokens = [token.strip() for token in energy_span_ev.split(",") if token.strip()]
+        if not tokens:
+            raise ValueError("at least one energy span value is required")
+        return tuple(float(token) for token in tokens)
+
+    if isinstance(energy_span_ev, (int, float)):
+        return (float(energy_span_ev),)
+
+    energy_span_list = tuple(float(value) for value in energy_span_ev)
+    if not energy_span_list:
+        raise ValueError("at least one energy span value is required")
+    return energy_span_list
+
+
+def format_energy_span_suffix(energy_span_ev: float) -> str:
+    return f"{energy_span_ev:g}".replace(".", "p")
+
+
+def make_energy_span_output_path(
+    base_path: Path,
+    energy_span_ev: float,
+    multiple_energy_spans: bool,
+) -> Path:
+    if not multiple_energy_spans:
+        return base_path
+
+    suffix = format_energy_span_suffix(energy_span_ev)
+    return base_path.with_name(f"{base_path.stem}_we_{suffix}eV{base_path.suffix}")
+
+
+def make_energy_span_plot_output_dir(
+    base_output_dir: Path,
+    energy_span_ev: float,
+    multiple_energy_spans: bool,
+) -> Path:
+    if not multiple_energy_spans:
+        return base_output_dir
+
+    suffix = format_energy_span_suffix(energy_span_ev)
+    return base_output_dir / f"we_{suffix}eV"
 
 
 def build_config(
@@ -594,6 +660,7 @@ def compute_axis_bin_edges(values: np.ndarray) -> np.ndarray:
 def plot_curves(
     curves: list[AveragedCurve],
     output_dir: Path,
+    energy_span_ev: float,
     show_plots: bool = False,
 ) -> None:
     import matplotlib
@@ -605,18 +672,17 @@ def plot_curves(
     from matplotlib.ticker import FuncFormatter, LogLocator
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    colors = plt.colormaps["viridis"](np.linspace(0.1, 0.9, len(curves)))
     plot_specs = [
         (
             lambda temperature_k: 1.0e3 / temperature_k,
             r"$1 / T$ ($10^{-3}$ K$^{-1}$)",
-            r"$\langle \sigma \rangle$ (S/cm) vs $1/T$",
+            rf"$\langle \sigma \rangle$ (S/cm) vs $1/T$ ($W_E$ = {energy_span_ev:.3g} eV)",
             (2.0, 10.0),
         ),
         (
             lambda temperature_k: 1.0e3 / np.sqrt(temperature_k),
             r"$1 / \sqrt{T}$ ($10^{-3}$ K$^{-1/2}$)",
-            r"$\langle \sigma \rangle$ (S/cm) vs $1/\sqrt{T}$",
+            rf"$\langle \sigma \rangle$ (S/cm) vs $1/\sqrt{{T}}$ ($W_E$ = {energy_span_ev:.3g} eV)",
             (50.0, 100.0),
         ),
     ]
@@ -625,7 +691,18 @@ def plot_curves(
     for ax, (transform, xlabel, title, x_limits) in zip(axes, plot_specs):
         has_data = False
 
-        for color, curve in zip(colors, curves):
+        for target_xi_nm, color in PLOT_HIGHLIGHT_XI_COLORS:
+            curve = next(
+                (
+                    candidate_curve
+                    for candidate_curve in curves
+                    if np.isclose(candidate_curve.xi_nm, target_xi_nm)
+                ),
+                None,
+            )
+            if curve is None:
+                continue
+
             x_values = transform(curve.temperatures_k)
             y_values = curve.mean_conductivity
             positive_mask = y_values > 0.0
@@ -685,6 +762,7 @@ def plot_vrh_fit_map(
     fit_results: list[VRHFitResult],
     output_dir: Path,
     error_threshold: float,
+    energy_span_ev: float,
     show_plots: bool = False,
 ) -> None:
     import matplotlib
@@ -734,7 +812,10 @@ def plot_vrh_fit_map(
 
     ax.set_xlabel(r"$T_x$ (K)")
     ax.set_ylabel(r"$\xi$ (nm)")
-    ax.set_title(r"$T_x$ vs $\xi$ colored by $\epsilon_{\mathrm{VRH}}(T_x)$")
+    ax.set_title(
+        rf"$T_x$ vs $\xi$ colored by $\epsilon_{{\mathrm{{VRH}}}}(T_x)$ "
+        rf"($W_E$ = {energy_span_ev:.3g} eV)"
+    )
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
 
@@ -820,7 +901,7 @@ def print_vrh_fit_summary(
 def main(
     n_sites: int = 100,
     delta_min_nm: float = 1.0,
-    energy_span_ev: float = 0.4,
+    energy_span_ev: str | float | int | list[float] | tuple[float, ...] = "0.4",
     cross_section_area_nm2: float = 1.0,
     xi_values_nm: str | float | int | list[float] | tuple[float, ...] = ",".join(
         str(value) for value in DEFAULT_XI_VALUES_NM
@@ -840,68 +921,100 @@ def main(
     plot_output_dir: str | None = None,
     show_plots: bool = False,
 ) -> None:
-    config = build_config(
-        n_sites=n_sites,
-        delta_min_nm=delta_min_nm,
-        energy_span_ev=energy_span_ev,
-        cross_section_area_nm2=cross_section_area_nm2,
-        xi_values_nm=xi_values_nm,
-        t_min_k=t_min_k,
-        t_max_k=t_max_k,
-        t_step_k=t_step_k,
-        n_realizations=n_realizations,
-        seed=seed,
-        g0=g0,
-        min_conductance=min_conductance,
-        output=output,
-        no_output=no_output,
-    )
-    curves = simulate_averaged_curves(config)
-    fit_results = analyze_vrh_transitions(
-        curves,
-        error_threshold=fit_error_threshold,
-        min_fit_points=fit_min_points,
-    )
+    energy_span_values_ev = parse_energy_span_values(energy_span_ev)
+    multiple_energy_spans = len(energy_span_values_ev) > 1
+    base_output_path = Path(output) if output is not None else DEFAULT_OUTPUT_PATH
 
-    if config.output_path is not None:
-        write_curves_csv(curves, config.output_path)
-        print(f"\nSaved averaged curves to {config.output_path}")
-        fit_summary_output = make_derived_output_path(config.output_path, "vrh_fit_summary")
-        fit_scan_output = make_derived_output_path(config.output_path, "vrh_fit_scan")
-        write_vrh_fit_summary_csv(
-            fit_results,
-            fit_summary_output,
+    for index, single_energy_span_ev in enumerate(energy_span_values_ev):
+        if index > 0:
+            print("")
+
+        print(f"Running 1D experiment for W_E = {single_energy_span_ev:.3g} eV")
+
+        span_output = make_energy_span_output_path(
+            base_output_path,
+            single_energy_span_ev,
+            multiple_energy_spans=multiple_energy_spans,
+        )
+        config = build_config(
+            n_sites=n_sites,
+            delta_min_nm=delta_min_nm,
+            energy_span_ev=single_energy_span_ev,
+            cross_section_area_nm2=cross_section_area_nm2,
+            xi_values_nm=xi_values_nm,
+            t_min_k=t_min_k,
+            t_max_k=t_max_k,
+            t_step_k=t_step_k,
+            n_realizations=n_realizations,
+            seed=seed,
+            g0=g0,
+            min_conductance=min_conductance,
+            output=str(span_output),
+            no_output=no_output,
+        )
+        curves = simulate_averaged_curves(config)
+        fit_results = analyze_vrh_transitions(
+            curves,
             error_threshold=fit_error_threshold,
             min_fit_points=fit_min_points,
         )
-        write_vrh_fit_scan_csv(
-            fit_results,
-            fit_scan_output,
-            error_threshold=fit_error_threshold,
-        )
-        print(f"Saved VRH fit summary to {fit_summary_output}")
-        print(f"Saved VRH fit scan to {fit_scan_output}")
 
-    print_summary(curves, cross_section_area_nm2=config.cross_section_area_nm2)
-    print_vrh_fit_summary(
-        fit_results,
-        error_threshold=fit_error_threshold,
-        min_fit_points=fit_min_points,
-    )
+        if config.output_path is not None:
+            write_curves_csv(curves, config.output_path)
+            print(f"\nSaved averaged curves to {config.output_path}")
+            fit_summary_output = make_derived_output_path(
+                config.output_path,
+                "vrh_fit_summary",
+            )
+            fit_scan_output = make_derived_output_path(
+                config.output_path,
+                "vrh_fit_scan",
+            )
+            write_vrh_fit_summary_csv(
+                fit_results,
+                fit_summary_output,
+                error_threshold=fit_error_threshold,
+                min_fit_points=fit_min_points,
+            )
+            write_vrh_fit_scan_csv(
+                fit_results,
+                fit_scan_output,
+                error_threshold=fit_error_threshold,
+            )
+            print(f"Saved VRH fit summary to {fit_summary_output}")
+            print(f"Saved VRH fit scan to {fit_scan_output}")
 
-    if plot:
-        output_dir = resolve_plot_output_dir(
-            plot_output_dir=plot_output_dir,
-            output_path=config.output_path,
-        )
-        print("")
-        plot_curves(curves, output_dir=output_dir, show_plots=show_plots)
-        plot_vrh_fit_map(
+        print_summary(curves, cross_section_area_nm2=config.cross_section_area_nm2)
+        print_vrh_fit_summary(
             fit_results,
-            output_dir=output_dir,
             error_threshold=fit_error_threshold,
-            show_plots=show_plots,
+            min_fit_points=fit_min_points,
         )
+
+        if plot:
+            base_plot_output_dir = resolve_plot_output_dir(
+                plot_output_dir=plot_output_dir,
+                output_path=config.output_path,
+            )
+            output_dir = make_energy_span_plot_output_dir(
+                base_plot_output_dir,
+                single_energy_span_ev,
+                multiple_energy_spans=multiple_energy_spans,
+            )
+            print("")
+            plot_curves(
+                curves,
+                output_dir=output_dir,
+                energy_span_ev=single_energy_span_ev,
+                show_plots=show_plots,
+            )
+            plot_vrh_fit_map(
+                fit_results,
+                output_dir=output_dir,
+                error_threshold=fit_error_threshold,
+                energy_span_ev=single_energy_span_ev,
+                show_plots=show_plots,
+            )
 
 
 if __name__ == "__main__":
