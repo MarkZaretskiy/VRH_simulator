@@ -1,6 +1,7 @@
 import numpy as np
 from dataclasses import dataclass
 from scipy.sparse import lil_matrix, csr_matrix
+from scipy.sparse.csgraph import connected_components
 from scipy.sparse.linalg import spsolve
 
 
@@ -179,6 +180,48 @@ class RRNSolver:
         L.setdiag(degrees)
         return L.tocsr()
 
+    @staticmethod
+    def contacts_are_connected(
+        C: csr_matrix,
+        left_nodes: np.ndarray | list[int],
+        right_nodes: np.ndarray | list[int],
+    ) -> bool:
+        """
+        Return True if any left contact node shares a connected component
+        with any right contact node in the sparse conductance graph.
+        """
+        left_nodes = np.asarray(left_nodes, dtype=int)
+        right_nodes = np.asarray(right_nodes, dtype=int)
+
+        if left_nodes.size == 0 or right_nodes.size == 0:
+            return False
+        if C.shape[0] == 0:
+            return False
+
+        _, labels = connected_components(C, directed=False, return_labels=True)
+        left_labels = np.unique(labels[left_nodes])
+        right_labels = np.unique(labels[right_nodes])
+        return np.intersect1d(left_labels, right_labels).size > 0
+
+    @staticmethod
+    def nodes_connected_to_boundary(
+        C: csr_matrix,
+        boundary_nodes: np.ndarray | list[int],
+    ) -> np.ndarray:
+        """
+        Return a boolean mask marking nodes that belong to any connected
+        component touching the Dirichlet boundary.
+        """
+        boundary_nodes = np.asarray(boundary_nodes, dtype=int)
+        if C.shape[0] == 0:
+            return np.zeros(0, dtype=bool)
+        if boundary_nodes.size == 0:
+            return np.zeros(C.shape[0], dtype=bool)
+
+        _, labels = connected_components(C, directed=False, return_labels=True)
+        boundary_labels = np.unique(labels[boundary_nodes])
+        return np.isin(labels, boundary_labels)
+
     def solve(
         self,
         left_nodes: np.ndarray | list[int],
@@ -198,13 +241,20 @@ class RRNSolver:
             raise ValueError("left_nodes and right_nodes must not overlap")
 
         N = self.n_sites
-        all_nodes = np.arange(N)
         boundary = np.unique(np.concatenate([left_nodes, right_nodes]))
-        internal = np.setdiff1d(all_nodes, boundary)
 
         C_scaled, log_shift = self.build_scaled_conductance_matrix()
+        if not self.contacts_are_connected(C_scaled, left_nodes, right_nodes):
+            raise ValueError(
+                "no conductive path connects left_nodes and right_nodes"
+            )
         scale_factor = float(np.exp(log_shift))
         L_scaled = self.build_laplacian(C_scaled)
+        # Components that do not touch either contact have no effect on the
+        # two-terminal conductance, but they do make the reduced Laplacian
+        # singular. Exclude them from the Dirichlet solve.
+        active_mask = self.nodes_connected_to_boundary(C_scaled, boundary)
+        active_nodes = np.flatnonzero(active_mask)
 
         V_boundary = np.zeros(N, dtype=float)
         V_boundary[left_nodes] = V_left
@@ -213,6 +263,7 @@ class RRNSolver:
         V = np.zeros(N, dtype=float)
         V[boundary] = V_boundary[boundary]
 
+        internal = np.setdiff1d(active_nodes, boundary)
         if internal.size > 0:
             L_ii = L_scaled[internal][:, internal]
             L_ib = L_scaled[internal][:, boundary]
@@ -265,13 +316,26 @@ def make_random_sites(
 def contact_nodes_from_x(
     positions: np.ndarray,
     contact_width: float,
+    x_min: float | None = None,
+    x_max: float | None = None,
 ):
     """
     Define left/right contacts by x-coordinate.
+
+    If x_min/x_max are provided, they are treated as the fixed device
+    boundaries. Otherwise the bounds are inferred from the sampled sites.
     """
     x = positions[:, 0]
-    x_min = np.min(x)
-    x_max = np.max(x)
+    if x_min is None:
+        x_min = float(np.min(x))
+    else:
+        x_min = float(x_min)
+    if x_max is None:
+        x_max = float(np.max(x))
+    else:
+        x_max = float(x_max)
+    if x_max < x_min:
+        raise ValueError("x_max must be >= x_min")
 
     left_nodes = np.where(x <= x_min + contact_width)[0]
     right_nodes = np.where(x >= x_max - contact_width)[0]

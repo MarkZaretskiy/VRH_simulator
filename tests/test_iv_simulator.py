@@ -1,12 +1,16 @@
 from __future__ import annotations
 
-import csv
 import io
 import sys
 import unittest
+import warnings
 from contextlib import redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
+
+import numpy as np
+import pandas as pd
+from scipy.sparse.linalg import MatrixRankWarning
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -16,6 +20,7 @@ if str(CODE_DIR) not in sys.path:
     sys.path.insert(0, str(CODE_DIR))
 
 import iv_simulator
+import sim
 
 
 EXPECTED_TEMPERATURES_K = [float(value) for value in range(10, 201, 10)]
@@ -44,7 +49,6 @@ class IVSimulatorConcentrationSweepTests(unittest.TestCase):
             "device_length_nm": 20.0,
             "device_width_nm": 10.0,
             "device_thickness_nm": 3.0,
-            "contact_width": 3.0,
             "cutoff_distance": None,
             "max_neighbors": None,
             "min_conductance": 0.0,
@@ -65,33 +69,30 @@ class IVSimulatorConcentrationSweepTests(unittest.TestCase):
         )
 
         self.assertTrue(output_path.exists())
-        with output_path.open(newline="", encoding="utf-8") as handle:
-            rows = list(csv.DictReader(handle))
+        table = pd.read_csv(output_path)
 
-        self.assertEqual(len(rows), len(EXPECTED_TEMPERATURES_K) * 3)
+        self.assertEqual(len(table), len(EXPECTED_TEMPERATURES_K) * 3)
 
-        temperatures = sorted({float(row["temperature_K"]) for row in rows})
-        voltages = sorted({float(row["voltage_V"]) for row in rows})
+        temperatures = sorted(table["temperature_K"].unique().tolist())
+        voltages = sorted(table["voltage_V"].unique().tolist())
         self.assertEqual(temperatures, EXPECTED_TEMPERATURES_K)
         self.assertEqual(voltages, [-0.5, 0.0, 0.5])
 
         for temperature_k in temperatures:
-            temperature_rows = {
-                float(row["voltage_V"]): row
-                for row in rows
-                if float(row["temperature_K"]) == temperature_k
-            }
-            non_conductive_count = int(
-                temperature_rows[0.0]["non_conductive_realizations"]
+            temperature_rows = table[table["temperature_K"] == temperature_k].set_index(
+                "voltage_V"
             )
-            negative_current = float(temperature_rows[-0.5]["current_mean_A"])
-            zero_current = float(temperature_rows[0.0]["current_mean_A"])
-            positive_current = float(temperature_rows[0.5]["current_mean_A"])
+            non_conductive_count = int(
+                temperature_rows.loc[0.0, "non_conductive_realizations"]
+            )
+            negative_current = float(temperature_rows.loc[-0.5, "current_mean_A"])
+            zero_current = float(temperature_rows.loc[0.0, "current_mean_A"])
+            positive_current = float(temperature_rows.loc[0.5, "current_mean_A"])
 
-            for row in temperature_rows.values():
-                self.assertEqual(int(row["n_realizations"]), 1)
+            for row in temperature_rows.itertuples():
+                self.assertEqual(int(row.n_realizations), 1)
                 self.assertEqual(
-                    int(row["non_conductive_realizations"]),
+                    int(row.non_conductive_realizations),
                     non_conductive_count,
                 )
 
@@ -124,6 +125,102 @@ class IVSimulatorConcentrationSweepTests(unittest.TestCase):
         self.assertGreater(iv_plot_path.stat().st_size, 0)
         self.assertTrue(conductance_plot_path.exists())
         self.assertGreater(conductance_plot_path.stat().st_size, 0)
+
+
+class RRNSolverRobustnessTests(unittest.TestCase):
+    def test_solver_ignores_disconnected_islands_when_contacts_are_connected(self) -> None:
+        positions = np.array([[0.0], [1.0], [1000.0]], dtype=float)
+        energies = np.zeros(3, dtype=float)
+        solver = sim.RRNSolver(
+            positions=positions,
+            energies=energies,
+            temperature=300.0,
+            xi=1.0,
+            G0=1.0,
+            cutoff_distance=2.0,
+        )
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings("error", category=MatrixRankWarning)
+            result = solver.solve(
+                left_nodes=np.array([0], dtype=int),
+                right_nodes=np.array([1], dtype=int),
+                V_left=1.0,
+                V_right=0.0,
+            )
+
+        expected_conductance = (1.0 / 300.0) * np.exp(-2.0)
+        self.assertAlmostEqual(
+            result.effective_conductance,
+            expected_conductance,
+            places=15,
+        )
+
+
+class ContactSelectionTests(unittest.TestCase):
+    def test_build_contacts_uses_fixed_device_bounds_instead_of_sample_extrema(self) -> None:
+        positions = np.array([[1.2], [2.2], [60.0], [119.0]], dtype=float)
+        config = iv_simulator.SimulationConfig(
+            positions=[[1.2], [2.2], [60.0], [119.0]],
+            energies=[0.0, 0.0, 0.0, 0.0],
+            n_realizations=1,
+        )
+
+        left_nodes, right_nodes = iv_simulator.build_contacts(
+            config,
+            positions=positions,
+            x_min=0.0,
+            x_max=120.0,
+        )
+
+        np.testing.assert_array_equal(left_nodes, np.array([0], dtype=int))
+        np.testing.assert_array_equal(right_nodes, np.array([3], dtype=int))
+
+    def test_contact_region_width_uses_absolute_layer_thickness_constant(self) -> None:
+        self.assertAlmostEqual(
+            iv_simulator.resolve_contact_region_width(),
+            iv_simulator.DEFAULT_CONTACT_LAYER_THICKNESS_NM,
+        )
+
+    def test_build_contacts_falls_back_to_nearest_boundary_nodes_when_strip_is_empty(self) -> None:
+        positions = np.array([[0.8], [60.0], [119.2]], dtype=float)
+        config = iv_simulator.SimulationConfig(
+            positions=positions.tolist(),
+            energies=[0.0, 0.0, 0.0],
+            xi=0.35,
+            n_realizations=1,
+        )
+
+        left_nodes, right_nodes = iv_simulator.build_contacts(
+            config,
+            positions=positions,
+            x_min=0.0,
+            x_max=120.0,
+        )
+
+        np.testing.assert_array_equal(left_nodes, np.array([0], dtype=int))
+        np.testing.assert_array_equal(right_nodes, np.array([2], dtype=int))
+
+    def test_build_network_reports_fixed_x_bounds_for_generated_box_network(self) -> None:
+        config = iv_simulator.SimulationConfig(
+            concentration_cm3=1.8e20,
+            device_length_nm=20.0,
+            device_width_nm=10.0,
+            device_thickness_nm=3.0,
+            max_generated_sites=1000,
+            length=5.0,
+            dim=1,
+            energy_std=0.4,
+            seed=42,
+        )
+
+        _, _, metadata = iv_simulator.build_network(
+            config,
+            seed=42,
+        )
+
+        self.assertEqual(metadata["x_min"], 0.0)
+        self.assertEqual(metadata["x_max"], 20.0)
 
 
 if __name__ == "__main__":
