@@ -6,6 +6,13 @@ platforms = ["linux-64", "osx-64", "osx-arm64", "win-64"]
 
 [tasks]
 sim = "python code/sim.py"
+sweep = "python code/sweep.py"
+sweep-2 = "python code/sweep_2.py"
+sweep-3 = "python code/sweep_3.py"
+sweep-2-plotly = "python code/sweep_2_plotly.py"
+sweep-3-plotly = "python code/sweep_3_plotly.py"
+sweep-matplotlib = "python code/sweep_matplotlib.py"
+sweep-plotly = "python code/sweep_plotly.py"
 
 [dependencies]
 python = ">=3.10,<3.13"
@@ -14,3 +21,4 @@ scipy = ">=1.13,<2"
 fire = ">=0.7,<0.8"
 matplotlib-base = ">=3.9,<4"
 pandas = ">=2.2,<3"
+pyyaml = ">=6.0,<7"

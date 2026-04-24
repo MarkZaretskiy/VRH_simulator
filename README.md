@@ -1,271 +1,202 @@
 # VRH Simulator
 
-This repository contains a small Random Resistor Network (RRN) simulator for
-temperature-dependent hopping transport, together with a 1D experiment script
-used to reproduce the type of analysis shown in the paper
-`2601.01243v1.pdf` https://arxiv.org/pdf/2601.01243.
+This repository contains a small Random Resistor Network simulator for
+temperature-dependent hopping transport.
 
-The code focuses on:
+The two main entry points are:
 
-- solving hopping transport on a resistor network
-- scanning temperature and localization length
-- fitting the low-temperature VRH regime
-- detecting the temperature where the fit stops being VRH-like
-- generating CSV outputs and plots
-
-
-## Files
-
-### `code/sim.py`
-
-`sim.py` contains the network solver.
-
-Main pieces:
-
-- `RRNSolver`
-  Builds the hopping conductance matrix, assembles the graph Laplacian,
-  applies Dirichlet boundary conditions, solves for node voltages, and computes
-  the effective conductance.
-
-- `RRNResult`
-  Bundles the voltages, total current, effective conductance/resistance, and
-  the final matrices.
-
-- `make_random_sites(...)`
-  Helper for generating random site clouds.
-
-- `contact_nodes_from_x(...)`
-  Helper for defining left/right contacts from the x coordinate.
-
-Physics implemented in `RRNSolver`:
-
-- Pairwise hopping conductance:
-  `G_ij = (G0 / T) * exp(-2 r_ij / xi) * exp(-eps_ij / (kB T))`
-
-- Energy cost:
-  `eps_ij = 0.5 * (|eps_i| + |eps_j| + |eps_i - eps_j|)`
-
-- Kirchhoff solve:
-  the reduced Laplacian is solved with fixed left/right contact voltages
-
-Numerical stability in `sim.py`:
-
-- conductances are assembled in log-space first
-- the largest active `log(G_ij)` is subtracted before exponentiation
-- the network is solved on the globally scaled matrix
-- current and effective conductance are rescaled back afterwards
-
-This keeps node voltages unchanged while making the solve much more stable.
-
-
-### `code/1d_experiment.py`
-
-`1d_experiment.py` builds a regular 1D chain and repeats the simulation over:
-
-- temperature
-- localization length `xi`
-- multiple Monte Carlo realizations of the disorder
-
-What it does:
-
-1. Build a regular 1D chain with spacing `delta_min_nm`
-2. Assign random site energies in the window `[-W_E/2, W_E/2]`
-3. Solve the network for every temperature
-4. Average the conductivity curves over realizations
-5. Fit `ln(sigma)` vs `T^(-1/2)` on `[T_min, T_x]`
-6. Compute `epsilon_VRH(T_x)` for each scan window
-7. Detect the first `T_x` where the fit exceeds the threshold
-8. Write CSV files and optional plots
-
-Important helpers:
-
-- `build_config(...)`
-- `simulate_averaged_curves(...)`
-- `fit_vrh_transition(...)`
-- `plot_curves(...)`
-- `plot_vrh_fit_map(...)`
-
-Numerical guardrails in `1d_experiment.py`:
-
-- averaged curves are stabilized if a tiny non-physical negative value appears
-  from the linear solve near numerical zero
-- the VRH fit is only reported when there is a threshold-compliant VRH window
-- the `epsilon_VRH` heatmap is clipped to `[0, 15]` in plot units
+- `code/sim.py`: low-level network solver and helper utilities
+- `code/iv_simulator.py`: temperature sweep and linear I-V workflow with CSV and plots
+- `code/sweep.py`: grid sweep over device parameters with conductance-vs-temperature tables
 
 
 ## Environment
 
 This repo uses `pixi`.
 
-Basic environment usage:
+Basic check:
 
 ```bash
 pixi run python code/sim.py
 ```
 
 
-## How To Run
+## `code/sim.py`
 
-### 1. Default 1D experiment
+`sim.py` contains the core solver.
+
+Main pieces:
+
+- `RRNSolver`
+  Builds the hopping conductance matrix, assembles the graph Laplacian,
+  applies Dirichlet boundary conditions, solves node voltages, and computes
+  effective conductance.
+- `RRNResult`
+  Bundles voltages, total current, effective conductance/resistance, and the
+  final sparse matrices.
+- `make_random_sites(...)`
+  Generates a random cloud of sites and on-site energies.
+- `contact_nodes_from_x(...)`
+  Defines left and right contacts from the x coordinate.
+
+Physics implemented in `RRNSolver`:
+
+- Pairwise hopping conductance:
+  `G_ij = (G0 / T) * exp(-2 r_ij / xi) * exp(-eps_ij / (kB T))`
+- Energy cost:
+  `eps_ij = 0.5 * (|eps_i| + |eps_j| + |eps_i - eps_j|)`
+- Kirchhoff solve:
+  the reduced Laplacian is solved with fixed left and right contact voltages
+
+Numerical stability:
+
+- conductances are assembled in log-space first
+- the largest active `log(G_ij)` is subtracted before exponentiation
+- the solve is performed on the globally scaled matrix
+- current and effective conductance are rescaled afterwards
+
+Run the built-in example:
 
 ```bash
-pixi run python code/1d_experiment.py --plot
+pixi run python code/sim.py
 ```
 
-This writes:
 
-- `code/1d_experiment_results.csv`
-- `code/1d_experiment_results_vrh_fit_summary.csv`
-- `code/1d_experiment_results_vrh_fit_scan.csv`
-- plots in the default output directory
+## `code/iv_simulator.py`
 
+`iv_simulator.py` builds a disorder realization or a box-populated network,
+solves the conductance for each temperature, and converts the result into a
+linear I-V sweep.
 
-### 2. Dense xi sweep
+What it does:
 
-You can pass `xi` as a range:
+1. Builds a network from explicit `positions` and `energies`, from a box
+   concentration, or from a random site cloud.
+2. Selects left and right contact nodes automatically or uses explicit contact
+   indices.
+3. Solves the effective conductance for each temperature.
+4. Averages over `n_realizations`.
+5. Writes a CSV table and optional plots.
 
-```bash
-pixi run python code/1d_experiment.py \
-  --xi_values_nm 0.05:0.30:0.01 \
-  --n_realizations 100 \
-  --plot
-```
+### CLI Run
 
-Range syntax means:
-
-- `start:stop:step`
-- here: `0.05, 0.06, ..., 0.30`
-
-
-### 3. Run different energy spans
-
-Single energy span:
+Example run with direct CLI parameters:
 
 ```bash
-pixi run python code/1d_experiment.py --energy_span_ev 0.3 --plot
-```
-
-Multiple energy spans in one command (takes ~30min):
-
-```bash
-pixi run python code/1d_experiment.py \
-  --xi_values_nm 0.05:0.30:0.01 \
-  --n_realizations 100 \
-  --plot \
-  --energy_span_ev 0.4,0.3,0.2
-```
-
-If you include spaces, quote the value:
-
-```bash
-pixi run python code/1d_experiment.py \
-  --energy_span_ev "0.4, 0.3, 0.2" \
-  --plot
-```
-
-For multi-span runs, outputs are separated automatically, for example:
-
-- `..._we_0p4eV.csv`
-- `..._we_0p3eV.csv`
-- `..._we_0p2eV.csv`
-
-and plots go into per-span directories like:
-
-- `we_0p4eV/`
-- `we_0p3eV/`
-- `we_0p2eV/`
-
-
-### 4. Small quick test run
-
-Useful when checking code changes:
-
-```bash
-pixi run python code/1d_experiment.py \
-  --n_sites 20 \
-  --n_realizations 2 \
-  --xi_values_nm 0.1,0.15,0.3 \
-  --t_min_k 100 \
+pixi run python code/iv_simulator.py \
+  --concentration_cm3 1.8e20 \
+  --t_min_k 10 \
   --t_max_k 200 \
-  --t_step_k 50 \
-  --plot
+  --t_step_k 10 \
+  --v_min -0.5 \
+  --v_max 0.5 \
+  --v_step 0.1 \
+  --n_realizations 4 \
+  --n_jobs 4 \
+  --plot true \
+  --output tmp/iv_run.csv
 ```
 
+### Config Run
 
-## Plots
+`code/iv_simulator.py` can load a top-level JSON or YAML mapping.
 
-The script produces two main plot types.
+Example `tmp/iv_config.yaml`:
 
-### Conductivity curves
+```yaml
+concentration_cm3: 1.8e20
+temperatures_k: [10, 20, 30, 50, 80, 100, 150, 200]
+xi: 0.35
+G0: 1.0
+kB: 8.617333262145e-5
+cutoff_distance: 20.0
+max_neighbors: 100
+min_conductance: 0.0
+v_min: -0.5
+v_max: 0.5
+v_step: 0.1
+n_realizations: 4
+n_jobs: 4
+device_length_nm: 120.0
+device_width_nm: 30.0
+device_thickness_nm: 3.0
+max_generated_sites: 3000
+energy_std: 0.4
+seed: 42
+plot: true
+plot_output_dir: tmp/iv_plots
+show_plots: false
+output: tmp/iv_config_run.csv
+```
 
-`sigma_vs_inverse_temperature_and_inverse_sqrt_temperature.png`
+Run it:
 
-This contains:
+```bash
+pixi run python code/iv_simulator.py --config tmp/iv_config.yaml
+```
 
-- `sigma` vs `1/T`
-- `sigma` vs `1/sqrt(T)`
+When `--config` is used, all simulation parameters are read from the file.
 
-Only three highlighted curves are shown in the subplot styling:
+### Output
 
-- `xi = 0.1` in blue
-- `xi = 0.15` in red
-- `xi = 0.3` in green
+The main CSV output contains:
 
-
-### VRH fit map
-
-`xi_vs_tx_colored_by_epsilon_vrh.png`
-
-This is a heatmap of:
-
-- x-axis: `T_x`
-- y-axis: `xi`
-- color: `epsilon_VRH(T_x)`
-
-Plot-specific notes:
-
-- the color map is clipped to `[0, 15]` in units of `10^-3`
-- the threshold line is shown on the colorbar
-- the `T_c` curve is not overlaid on the heatmap
-
-
-## Outputs
-
-### `*_results.csv`
-
-Contains:
-
-- `xi_nm`
 - `temperature_K`
-- mean/std conductance
-- mean/std conductivity
+- `voltage_V`
+- `current_mean_A`
+- `current_std_A`
+- `conductance_mean_S`
+- `conductance_std_S`
+- `n_realizations`
+- `non_conductive_realizations`
+
+If `plot: true`, the script also writes plots for:
+
+- I-V curves vs temperature
+- conductance vs temperature
 
 
-### `*_vrh_fit_summary.csv`
+## `code/sweep.py`
 
-Contains one row per `xi` with:
+`code/sweep.py` runs a grid sweep for a box-defined device and saves
+conductance-vs-temperature tables for each parameter combination.
 
-- the selected fit window
-- whether the fit is threshold-compliant
-- transition temperature if one is detected
-- `epsilon_VRH(T_max)`
+It uses the same device baseline as `IVSimulatorDeviceTests`:
 
+- `device_length_nm = 100`
+- `device_width_nm = 50`
+- temperatures are fixed to `20..200 K` with step `10`
 
-### `*_vrh_fit_scan.csv`
+The swept grid dimensions are:
 
-Contains the full scan over `T_x` for each `xi`:
+- `device_thickness_nm`
+- `concentration_cm3`
+- `energy_std`
+- `xi`
 
-- `epsilon_VRH(T_x)`
-- fit slope/intercept
-- whether each scanned point is within threshold
+The sweep grid is hardcoded directly in [code/sweep.py](/home/mark/Desktop/Projects/ARIA/vrh_simulator/code/sweep.py).
+Edit these constants when you want to change the production run:
+
+- `SWEEP_DEVICE_THICKNESS_GRID_NM`
+- `SWEEP_CONCENTRATION_GRID_CM3`
+- `SWEEP_ENERGY_STD_GRID_EV`
+- `SWEEP_XI_GRID_NM`
+
+Run it:
+
+```bash
+pixi run sweep
+```
+
+Outputs:
+
+- `sweep_manifest.csv`: one row per parameter combination
+- `conductance_vs_temperature_all.csv`: combined long table for all combinations
+- `conductance_tables/*.csv`: one conductance-vs-temperature table per combination
 
 
 ## Notes
 
-- Very small conductivity values are expected in hopping transport.
-- Small `sigma` by itself is not the main numerical problem.
-- The hard part is the huge dynamic range in the conductance matrix.
-- That is why `sim.py` now assembles conductances in log-space first.
-
-If you want the figure to look more like the paper, the most important thing is
-to use a dense `xi` sweep rather than the default sparse set.
+- Very small conductance values are expected in hopping transport.
+- The main numerical difficulty is the dynamic range of the conductance matrix.
+- That is why `sim.py` assembles conductances in log-space before solving.
