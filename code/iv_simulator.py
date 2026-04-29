@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-import ast
 import multiprocessing as mp
 import os
+import sys
 import warnings
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
-import fire
 import numpy as np
 import pandas as pd
 from scipy.sparse.linalg import MatrixRankWarning
@@ -22,6 +21,15 @@ try:
         plot_iv_curves,
         resolve_plot_output_dir,
     )
+    from .utils import (
+        build_sweep_values,
+        load_mapping_file,
+        normalize_config_mapping,
+        parse_cli_args,
+        parse_float_values,
+        parse_index_array,
+        parse_optional_array,
+    )
 except ImportError:
     from sim import RRNSolver, contact_nodes_from_x, make_random_sites
     from plotting import (
@@ -30,67 +38,24 @@ except ImportError:
         plot_iv_curves,
         resolve_plot_output_dir,
     )
+    from utils import (
+        build_sweep_values,
+        load_mapping_file,
+        normalize_config_mapping,
+        parse_cli_args,
+        parse_float_values,
+        parse_index_array,
+        parse_optional_array,
+    )
 
 
 DEFAULT_OUTPUT_PATH = Path(__file__).resolve().parent / "iv_simulator_results.csv"
 DEFAULT_REFERENCE_VOLTAGE = 1.0
 DEFAULT_MAX_GENERATED_SITES = 3000
-DEFAULT_CONTACT_LAYER_THICKNESS_NM = 1.5
+DEFAULT_CONTACT_LAYER_THICKNESS_NM = 5.0
+DEFAULT_NEAREST_NEIGHBOR_STATS_K = 3
 NM_TO_CM = 1.0e-7
-
-
-def parse_optional_array(
-    value: (
-        str | list[float] | list[list[float]] | tuple[float, ...] | np.ndarray | None
-    ),
-    name: str,
-    ndim: int,
-) -> np.ndarray | None:
-    if value is None:
-        return None
-    if isinstance(value, np.ndarray):
-        array = np.asarray(value, dtype=float)
-    elif isinstance(value, str):
-        try:
-            parsed = ast.literal_eval(value)
-        except (SyntaxError, ValueError) as exc:
-            raise ValueError(
-                f"{name} must be a Python-like literal, for example "
-                f"'[0.1, -0.2, 0.3]' or '[[0.0], [1.0], [2.0]]'"
-            ) from exc
-        array = np.asarray(parsed, dtype=float)
-    else:
-        array = np.asarray(value, dtype=float)
-
-    if array.ndim != ndim:
-        raise ValueError(f"{name} must have ndim={ndim}, got shape {array.shape}")
-    return array
-
-
-def parse_index_array(
-    value: str | list[int] | tuple[int, ...] | np.ndarray | None,
-    name: str,
-) -> np.ndarray | None:
-    if value is None:
-        return None
-    if isinstance(value, np.ndarray):
-        array = np.asarray(value, dtype=int)
-    elif isinstance(value, str):
-        try:
-            parsed = ast.literal_eval(value)
-        except (SyntaxError, ValueError) as exc:
-            raise ValueError(
-                f"{name} must be a Python-like literal, for example '[0, 1, 2]'"
-            ) from exc
-        array = np.asarray(parsed, dtype=int)
-    else:
-        array = np.asarray(value, dtype=int)
-
-    if array.ndim != 1:
-        raise ValueError(f"{name} must be one-dimensional, got shape {array.shape}")
-    if array.size == 0:
-        raise ValueError(f"{name} must not be empty")
-    return array
+SUPPORTED_ENERGY_DISTRIBUTIONS = frozenset({"gaussian", "uniform"})
 
 
 def validate_positive_params(
@@ -123,6 +88,28 @@ def validate_contact_node_arrays(
     if left_nodes_array is not None and right_nodes_array is not None:
         if np.intersect1d(left_nodes_array, right_nodes_array).size > 0:
             raise ValueError("left_nodes and right_nodes must not overlap")
+
+
+def validate_energy_distribution(energy_distribution: str) -> None:
+    if energy_distribution not in SUPPORTED_ENERGY_DISTRIBUTIONS:
+        supported = ", ".join(sorted(SUPPORTED_ENERGY_DISTRIBUTIONS))
+        raise ValueError(
+            f"energy_distribution must be one of: {supported}"
+        )
+
+
+def sample_site_energies(
+    *,
+    rng: np.random.Generator,
+    energy_std: float,
+    energy_distribution: str,
+    n_sites: int,
+) -> np.ndarray:
+    validate_energy_distribution(energy_distribution)
+    if energy_distribution == "gaussian":
+        return rng.normal(0.0, energy_std, size=n_sites)
+    half_span = 0.5 * energy_std
+    return rng.uniform(-half_span, half_span, size=n_sites)
 
 
 def resolve_contact_region_width() -> float:
@@ -179,6 +166,7 @@ class SimulationConfig:
     length: float = 20.0
     dim: int = 1
     energy_std: float = 0.4
+    energy_distribution: str = "gaussian"
     seed: int | None = 42
 
     positions_array: np.ndarray | None = field(init=False, repr=False)
@@ -214,8 +202,10 @@ class SimulationConfig:
                 "n_realizations": self.n_realizations,
                 "xi": self.xi,
                 "G0": self.G0,
+                "energy_std": self.energy_std,
             }
         )
+        validate_energy_distribution(self.energy_distribution)
 
         validate_positions_and_energies(
             self.positions_array,
@@ -256,53 +246,52 @@ class SimulationConfig:
         )
 
 
-def build_sweep_values(start: float, stop: float, step: float) -> np.ndarray:
-    if step <= 0.0:
-        raise ValueError("step must be > 0")
-    if stop < start:
-        raise ValueError("stop must be >= start")
-
-    n_steps = int(np.floor((stop - start) / step))
-    values = start + step * np.arange(n_steps + 1, dtype=float)
-    if not np.isclose(values[-1], stop):
-        values = np.append(values, float(stop))
-    return np.unique(np.round(values, 12))
+SIMULATION_CONFIG_FIELD_NAMES = frozenset(
+    config_field.name for config_field in fields(SimulationConfig) if config_field.init
+)
+SIMULATION_CONFIG_BOOL_FIELDS = frozenset(
+    config_field.name
+    for config_field in fields(SimulationConfig)
+    if config_field.init and isinstance(config_field.default, bool)
+)
 
 
-def parse_float_values(
-    value: str | float | int | list[float] | tuple[float, ...] | np.ndarray | None,
-    name: str,
-) -> np.ndarray | None:
-    if value is None:
-        return None
-    if isinstance(value, np.ndarray):
-        array = np.asarray(value, dtype=float)
-    elif isinstance(value, str):
-        if ":" in value and "," not in value:
-            try:
-                start_text, stop_text, step_text = (
-                    token.strip() for token in value.split(":")
-                )
-                array = build_sweep_values(
-                    float(start_text),
-                    float(stop_text),
-                    float(step_text),
-                )
-            except ValueError as exc:
-                raise ValueError(f"{name} range must look like '5:250:25'") from exc
-        else:
-            tokens = [token.strip() for token in value.split(",") if token.strip()]
-            if not tokens:
-                raise ValueError(f"{name} must contain at least one value")
-            array = np.asarray([float(token) for token in tokens], dtype=float)
-    elif isinstance(value, (float, int)):
-        array = np.asarray([float(value)], dtype=float)
-    else:
-        array = np.asarray(value, dtype=float)
+def load_config_dict(path: str | Path) -> dict[str, object]:
+    config_path = Path(path)
+    data = load_mapping_file(config_path)
+    return normalize_config_mapping(
+        data,
+        source_name=f"config file {config_path}",
+        allowed_keys=SIMULATION_CONFIG_FIELD_NAMES,
+    )
 
-    if array.ndim != 1 or array.size == 0:
-        raise ValueError(f"{name} must be a non-empty 1D sequence of floats")
-    return np.unique(np.sort(array))
+
+def build_config_from_mapping(data: Mapping[str, object]) -> SimulationConfig:
+    normalized_data = normalize_config_mapping(
+        data,
+        source_name="configuration",
+        allowed_keys=SIMULATION_CONFIG_FIELD_NAMES,
+    )
+    return SimulationConfig(**normalized_data)
+
+
+def build_config_from_file(
+    path: str | Path,
+) -> SimulationConfig:
+    config_data = load_config_dict(path)
+    return SimulationConfig(**config_data)
+
+
+def cli_usage() -> str:
+    return (
+        "Usage:\n"
+        "  python code/iv_simulator.py [--field value ...]\n"
+        "  python code/iv_simulator.py --config CONFIG_PATH\n\n"
+        "Notes:\n"
+        "  - field names match SimulationConfig, for example --xi, --v_step, --plot\n"
+        "  - boolean flags accept true/false, or can be passed without a value to mean true\n"
+        "  - when --config is provided, all simulation parameters are read from the file\n"
+    )
 
 
 def build_temperature_values(
@@ -389,8 +378,13 @@ def build_network(
                 rng.uniform(0.0, config.device_width_nm, size=generated_n_sites),
                 rng.uniform(0.0, config.device_thickness_nm, size=generated_n_sites),
             ]
-        ) #TODO: change z from uniform to exponential
-        energies_array = rng.normal(0.0, config.energy_std, size=generated_n_sites)
+        )  # TODO: change z from uniform to exponential to mimick 2d
+        energies_array = sample_site_energies(
+            rng=rng,
+            energy_std=config.energy_std,
+            energy_distribution=config.energy_distribution,
+            n_sites=generated_n_sites,
+        )
         actual_concentration_cm3 = generated_n_sites / volume_cm3
         return (
             positions_array,
@@ -405,6 +399,8 @@ def build_network(
                 "expected_n_sites": float(expected_n_sites),
                 "concentration_cm3": float(config.concentration_cm3),
                 "actual_concentration_cm3": float(actual_concentration_cm3),
+                "energy_scale": float(config.energy_std),
+                "energy_distribution": str(config.energy_distribution),
                 "x_min": 0.0,
                 "x_max": float(config.device_length_nm),
             },
@@ -415,6 +411,7 @@ def build_network(
         length=config.length,
         dim=config.dim,
         energy_std=config.energy_std,
+        energy_distribution=config.energy_distribution,
         seed=seed,
     )
     return (
@@ -425,6 +422,8 @@ def build_network(
             "n_sites": int(config.n_sites),
             "dim": int(config.dim),
             "length": float(config.length),
+            "energy_scale": float(config.energy_std),
+            "energy_distribution": str(config.energy_distribution),
             "x_min": 0.0,
             "x_max": float(config.length),
         },
@@ -436,7 +435,47 @@ def summarize_samples(
 ) -> tuple[np.ndarray, np.ndarray]:
     if samples.ndim != 2:
         raise ValueError("samples must have shape (n_realizations, n_temperatures)")
-    return samples.mean(axis=0), samples.std(axis=0, ddof=0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        return np.nanmean(samples, axis=0), np.nanstd(samples, axis=0, ddof=0)
+
+
+def summarize_neighbor_distances(
+    positions: np.ndarray,
+    *,
+    k: int = DEFAULT_NEAREST_NEIGHBOR_STATS_K,
+) -> dict[str, object]:
+    positions_array = np.asarray(positions, dtype=float)
+    if positions_array.ndim != 2:
+        raise ValueError("positions must have shape (N, d)")
+    if positions_array.shape[0] < 2:
+        return {
+            "neighbor_rank_means_nm": np.empty(0, dtype=float),
+            "pooled_mean_nm": np.nan,
+        }
+
+    dummy_energies = np.zeros(positions_array.shape[0], dtype=float)
+    solver = RRNSolver(
+        positions=positions_array,
+        energies=dummy_energies,
+        temperature=300.0,
+        xi=1.0,
+    )
+    stats = solver.nearest_neighbor_distance_statistics(k=k)
+    per_neighbor = stats["per_neighbor"]
+    pooled = stats["pooled"]
+
+    return {
+        "neighbor_rank_means_nm": np.asarray(
+            [neighbor_stats.mean for neighbor_stats in per_neighbor],
+            dtype=float,
+        ),
+        "pooled_mean_nm": (
+            float(pooled.mean)
+            if pooled is not None
+            else np.nan
+        ),
+    }
 
 
 def realization_seed(base_seed: int | None, realization_index: int) -> int | None:
@@ -516,10 +555,17 @@ def print_network_metadata(result: dict[str, object]) -> None:
             f"expected_n_sites={network_metadata['expected_n_sites']:.3f}, "
             f"actual={network_metadata['actual_concentration_cm3']:.3e} cm^-3"
         )
+        print(
+            "Energy distribution: "
+            f"{network_metadata['energy_distribution']}, "
+            f"W_E={network_metadata['energy_scale']:.3g} eV"
+        )
     elif network_metadata["mode"] == "random":
         print(
             f"Random cloud: length={network_metadata['length']:.3g}, "
-            f"dim={int(network_metadata['dim'])}"
+            f"dim={int(network_metadata['dim'])}, "
+            f"energy_distribution={network_metadata['energy_distribution']}, "
+            f"W_E={network_metadata['energy_scale']:.3g} eV"
         )
 
 
@@ -566,8 +612,12 @@ def run_realization(
         x_min=float(network_metadata["x_min"]),
         x_max=float(network_metadata["x_max"]),
     )
+    neighbor_distance_summary = summarize_neighbor_distances(
+        positions_array,
+        k=DEFAULT_NEAREST_NEIGHBOR_STATS_K,
+    )
 
-    conductance_curve = np.empty(config.temperature_values_k.size, dtype=float)
+    conductance_curve = np.full(config.temperature_values_k.size, np.nan, dtype=float)
     non_conductive_curve = np.zeros(config.temperature_values_k.size, dtype=bool)
     for temperature_index, temperature_k in enumerate(config.temperature_values_k):
         try:
@@ -585,12 +635,14 @@ def run_realization(
                 min_conductance=config.min_conductance,
                 reference_voltage=DEFAULT_REFERENCE_VOLTAGE,
             )
-        except (MatrixRankWarning, FloatingPointError, ValueError) as exc:
+        except (MatrixRankWarning, FloatingPointError, ValueError, RuntimeError) as exc:
             if isinstance(exc, ValueError) and "no conductive path connects" not in str(
                 exc
             ):
                 raise
-            conductance_s = 0.0
+            if isinstance(exc, RuntimeError) and "factorize matrix" not in str(exc):
+                raise
+            conductance_s = np.nan
             non_conductive_curve[temperature_index] = True
         conductance_curve[temperature_index] = conductance_s
 
@@ -604,6 +656,7 @@ def run_realization(
         "dim": int(positions_array.shape[1]),
         "left_contacts": int(len(left_nodes_array)),
         "right_contacts": int(len(right_nodes_array)),
+        "neighbor_distance_summary": neighbor_distance_summary,
     }
 
 
@@ -634,9 +687,7 @@ def build_contacts(
         )
     if right_nodes_array.size == 0:
         excluded_index = (
-            int(left_nodes_array[0])
-            if left_nodes_array.size == 1
-            else None
+            int(left_nodes_array[0]) if left_nodes_array.size == 1 else None
         )
         right_nodes_array = np.asarray(
             [nearest_boundary_node(positions, x_max, exclude=excluded_index)],
@@ -691,6 +742,115 @@ def compute_conductance_for_temperature(
     return conductance_s
 
 
+def run(config: SimulationConfig) -> None:
+    temperatures_k = config.temperature_values_k
+    voltages_v = config.voltage_values_v
+    # number of realizations we will average over
+    n_realizations = config.n_realizations
+    resolved_n_jobs = config.resolved_n_jobs
+
+    conductance_samples = np.full(
+        (n_realizations, temperatures_k.size),
+        np.nan,
+        dtype=float,
+    )
+    non_conductive_mask = np.zeros_like(conductance_samples, dtype=bool)
+
+    print(
+        f"Running linear I-V sweep for {len(temperatures_k)} temperatures "
+        f"and {len(voltages_v)} voltages"
+    )
+    print(f"Ensemble realizations: {n_realizations}, base_seed={config.seed}")
+    print(f"Parallel workers: {resolved_n_jobs}")
+
+    metadata_printed = False
+    for result in iter_realization_results(
+        n_realizations=n_realizations,
+        resolved_n_jobs=resolved_n_jobs,
+        config=config,
+    ):
+        store_realization_result(
+            result,
+            conductance_samples,
+            non_conductive_mask,
+        )
+        if not metadata_printed:
+            print_network_metadata(result)
+            metadata_printed = True
+        print_realization_progress(result, n_realizations)
+
+    conductance_mean_s, conductance_std_s = summarize_samples(conductance_samples)
+    current_mean_a = conductance_mean_s[:, None] * voltages_v[None, :]
+    current_std_a = conductance_std_s[:, None] * np.abs(voltages_v[None, :])
+    zero_voltage_mask = np.isclose(voltages_v, 0.0)
+    if np.any(zero_voltage_mask):
+        current_mean_a[:, zero_voltage_mask] = 0.0
+        current_std_a[:, zero_voltage_mask] = 0.0
+    non_conductive_counts = non_conductive_mask.sum(axis=0)
+    output_path = (
+        None
+        if config.no_output
+        else (Path(config.output) if config.output is not None else DEFAULT_OUTPUT_PATH)
+    )
+
+    print("")
+    print("Ensemble summary:")
+    for temperature_index, temperature_k in enumerate(temperatures_k):
+        print(
+            f"T={temperature_k:6.1f} K  "
+            f"G_mean={conductance_mean_s[temperature_index]:.6e} S  "
+            f"G_std={conductance_std_s[temperature_index]:.6e} S  "
+            f"non_conductive={int(non_conductive_counts[temperature_index])}/{n_realizations}  "
+            f"I_mean({voltages_v[-1]:.3g} V)={current_mean_a[temperature_index, -1]:.6e} A"
+        )
+
+    if output_path is not None:
+        write_iv_csv(
+            temperatures_k=temperatures_k,
+            voltages_v=voltages_v,
+            current_mean_a=current_mean_a,
+            current_std_a=current_std_a,
+            conductance_mean_s=conductance_mean_s,
+            conductance_std_s=conductance_std_s,
+            n_realizations=n_realizations,
+            non_conductive_counts=non_conductive_counts,
+            output_path=output_path,
+        )
+        print(f"\nSaved I-V table to {output_path}")
+
+    if config.plot:
+        plot_dir = resolve_plot_output_dir(
+            plot_output_dir=config.plot_output_dir,
+            output_path=output_path,
+        )
+        plot_annotation = format_box_plot_annotation(
+            concentration_cm3=config.concentration_cm3,
+            device_length_nm=config.device_length_nm,
+            device_width_nm=config.device_width_nm,
+            device_thickness_nm=config.device_thickness_nm,
+        )
+        print("")
+        plot_iv_curves(
+            temperatures_k=temperatures_k,
+            voltages_v=voltages_v,
+            current_mean_a=current_mean_a,
+            current_std_a=current_std_a,
+            output_dir=plot_dir,
+            n_realizations=n_realizations,
+            plot_annotation=plot_annotation,
+            show_plots=config.show_plots,
+        )
+        plot_conductance_vs_temperature(
+            temperatures_k=temperatures_k,
+            conductance_mean_s=conductance_mean_s,
+            conductance_std_s=conductance_std_s,
+            output_dir=plot_dir,
+            n_realizations=n_realizations,
+            plot_annotation=plot_annotation,
+            show_plots=config.show_plots,
+        )
+
+
 def main(
     positions: str | list[list[float]] | np.ndarray | None = None,
     energies: str | list[float] | np.ndarray | None = None,
@@ -727,8 +887,11 @@ def main(
     length: float = 20.0,
     dim: int = 1,
     energy_std: float = 0.4,
+    energy_distribution: str = "gaussian",
     seed: int | None = 42,
 ) -> None:
+
+    #  we need it here because class SimulationConfig has logic with checking validity of argument
     config = SimulationConfig(
         positions=positions,
         energies=energies,
@@ -763,107 +926,40 @@ def main(
         length=length,
         dim=dim,
         energy_std=energy_std,
+        energy_distribution=energy_distribution,
         seed=seed,
     )
-    temperatures_k = config.temperature_values_k
-    voltages_v = config.voltage_values_v
-    # number of realizations we will average over
-    n_realizations = config.n_realizations
-    resolved_n_jobs = config.resolved_n_jobs
+    run(config)
 
-    conductance_samples = np.empty((n_realizations, temperatures_k.size), dtype=float)
-    non_conductive_mask = np.zeros_like(conductance_samples, dtype=bool)
 
-    print(
-        f"Running linear I-V sweep for {len(temperatures_k)} temperatures "
-        f"and {len(voltages_v)} voltages"
-    )
-    print(f"Ensemble realizations: {n_realizations}, base_seed={config.seed}")
-    print(f"Parallel workers: {resolved_n_jobs}")
+def main_from_file(config_path: str | Path) -> None:
+    config = build_config_from_file(config_path)
+    run(config)
 
-    metadata_printed = False
-    for result in iter_realization_results(
-        n_realizations=n_realizations,
-        resolved_n_jobs=resolved_n_jobs,
-        config=config,
-    ):
-        store_realization_result(
-            result,
-            conductance_samples,
-            non_conductive_mask,
-        )
-        if not metadata_printed:
-            print_network_metadata(result)
-            metadata_printed = True
-        print_realization_progress(result, n_realizations)
 
-    conductance_mean_s, conductance_std_s = summarize_samples(conductance_samples)
-    current_mean_a = conductance_mean_s[:, None] * voltages_v[None, :]
-    current_std_a = conductance_std_s[:, None] * np.abs(voltages_v[None, :])
-    non_conductive_counts = non_conductive_mask.sum(axis=0)
-    output_path = (
-        None
-        if config.no_output
-        else (Path(config.output) if config.output is not None else DEFAULT_OUTPUT_PATH)
-    )
+def cli(argv: list[str] | None = None) -> None:
+    command = list(sys.argv[1:] if argv is None else argv)
+    if any(token in {"-h", "--help"} for token in command):
+        print(cli_usage(), end="")
+        return
+    try:
+        config_path, params = parse_cli_args(
+            command,
+            option_names=SIMULATION_CONFIG_FIELD_NAMES,
+            bool_fields=SIMULATION_CONFIG_BOOL_FIELDS,
+        )
+        if config_path is not None and params:
+            raise ValueError(
+                "cannot combine --config with other simulation options"
+            )
+    except ValueError as exc:
+        raise SystemExit(f"{exc}\n\n{cli_usage()}") from exc
 
-    print("")
-    print("Ensemble summary:")
-    for temperature_index, temperature_k in enumerate(temperatures_k):
-        print(
-            f"T={temperature_k:6.1f} K  "
-            f"G_mean={conductance_mean_s[temperature_index]:.6e} S  "
-            f"G_std={conductance_std_s[temperature_index]:.6e} S  "
-            f"non_conductive={int(non_conductive_counts[temperature_index])}/{n_realizations}  "
-            f"I_mean({voltages_v[-1]:.3g} V)={current_mean_a[temperature_index, -1]:.6e} A"
-        )
-
-    if output_path is not None:
-        write_iv_csv(
-            temperatures_k=temperatures_k,
-            voltages_v=voltages_v,
-            current_mean_a=current_mean_a,
-            current_std_a=current_std_a,
-            conductance_mean_s=conductance_mean_s,
-            conductance_std_s=conductance_std_s,
-            n_realizations=n_realizations,
-            non_conductive_counts=non_conductive_counts,
-            output_path=output_path,
-        )
-        print(f"\nSaved I-V table to {output_path}")
-
-    if plot:
-        plot_dir = resolve_plot_output_dir(
-            plot_output_dir=config.plot_output_dir,
-            output_path=output_path,
-        )
-        plot_annotation = format_box_plot_annotation(
-            concentration_cm3=config.concentration_cm3,
-            device_length_nm=config.device_length_nm,
-            device_width_nm=config.device_width_nm,
-            device_thickness_nm=config.device_thickness_nm,
-        )
-        print("")
-        plot_iv_curves(
-            temperatures_k=temperatures_k,
-            voltages_v=voltages_v,
-            current_mean_a=current_mean_a,
-            current_std_a=current_std_a,
-            output_dir=plot_dir,
-            n_realizations=n_realizations,
-            plot_annotation=plot_annotation,
-            show_plots=config.show_plots,
-        )
-        plot_conductance_vs_temperature(
-            temperatures_k=temperatures_k,
-            conductance_mean_s=conductance_mean_s,
-            conductance_std_s=conductance_std_s,
-            output_dir=plot_dir,
-            n_realizations=n_realizations,
-            plot_annotation=plot_annotation,
-            show_plots=config.show_plots,
-        )
+    if config_path is None:
+        main(**params)
+    else:
+        main_from_file(config_path)
 
 
 if __name__ == "__main__":
-    fire.Fire(main)
+    cli()
